@@ -1,0 +1,29 @@
+# ESP-IDF build output
+build/
+managed_components/
+dependencies.lock
+
+# Binary outputs
+*.bin
+*.elf
+*.map
+*.hex
+
+# ESP-IDF temporary/config backups
+sdkconfig.old
+
+# VS Code / local editor files
+.vscode/
+.idea/
+
+# Python / virtual env
+venv/
+.env/
+__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
