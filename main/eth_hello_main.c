@@ -47,6 +47,12 @@
 #include "usb/usb_host.h"
 #include "esp_intr_alloc.h"
 
+/*
+ * Déclaration explicite pour éviter toute erreur d'implicit declaration
+ * selon la version exacte des headers ESP-IDF installés.
+ */
+extern esp_err_t usb_host_lib_set_root_port_power(bool enable);
+
 #define ETH_LINK_UP_BIT BIT0
 #define ETH_GOT_IP_BIT  BIT1
 
@@ -475,6 +481,15 @@ static bool s_live_start_requested = false;
 static volatile bool s_live_running = false;
 
 /*
+ * Devient vrai après le premier vrai paquet vidéo reçu.
+ * Sert à distinguer :
+ * - premier démarrage normal : on tente START normalement ;
+ * - reconnexion USB après un live déjà lancé : on évite le START inutile qui donne error 4,
+ *   et on lance directement la recovery forte qui a été validée dans les tests.
+ */
+static volatile bool s_live_has_ever_run = false;
+
+/*
  * Anti-spam recovery :
  * - ARP retry : si la GoPro ne répond pas tout de suite.
  * - Live retry : si START échoue ou si le flux UDP s'arrête.
@@ -532,7 +547,7 @@ static err_t gopro_usb_netif_init(struct netif *netif);
 // Port UDP utilisé par le flux webcam GoPro.
 #define GOPRO_WEBCAM_UDP_PORT 5000
 // Adresse du PC qui affichera la vidéo dans VLC.
-#define PC_STREAM_IP "10.5.159.150"
+#define PC_STREAM_IP "10.5.159.148"
 // Port UDP écouté par VLC sur le PC.
 #define PC_STREAM_PORT 5001
 
@@ -629,22 +644,41 @@ static bool s_gopro_webcam_task_started = false;
 static void gopro_start_webcam_once(void);
 static void gopro_webcam_task(void *arg);
 
-static esp_err_t gopro_http_get_usb(
-    const char *path,
-    const char *label,
-    char *response,
-    size_t response_size
-);
-
-static void gopro_recovery_after_reboot_before_start(void);
+/*
+ * Recovery 100 % code, sans modifier le câble USB.
+ * Niveau 1 : tentative Labs !OR via HTTP USB.
+ * Niveau 2 : reset logique du root port USB Host ESP32-P4.
+ */
+static volatile bool s_gopro_code_recovery_running = false;
+static uint32_t s_live_fail_count = 0;
+static void gopro_schedule_code_only_recovery(const char *reason);
 
 static void gopro_usb_allow_live_retry(const char *reason)
 {
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
+    /*
+     * On libère immédiatement la possibilité de recréer une tâche live,
+     * mais on évite de spammer START : la recovery prend la main.
+     */
     s_gopro_webcam_task_started = false;
     s_live_running = false;
     s_live_start_requested = false;
+
+    s_live_fail_count++;
+
+    ESP_LOGW(
+        TAG,
+        "[RECOVERY] Échec live USB n°%" PRIu32 " : %s",
+        s_live_fail_count,
+        reason
+    );
+
+    if (s_gopro_code_recovery_running) {
+        ESP_LOGW(TAG, "[RECOVERY] Recovery déjà en cours, pas de nouvelle action");
+        s_next_live_attempt_ms = now_ms + 120000;
+        return;
+    }
 
     if (!s_gopro_open || !s_usb_gopro_detected || !s_cdc_network_connected) {
         ESP_LOGW(
@@ -652,16 +686,18 @@ static void gopro_usb_allow_live_retry(const char *reason)
             "[RECOVERY] %s -> GoPro USB absente, attente reconnexion USB",
             reason
         );
+        s_next_live_attempt_ms = now_ms + 30000;
         return;
     }
 
-    s_next_live_attempt_ms = now_ms + 60000;
+    /*
+     * Ici on ne se contente plus de refaire webcam/start.
+     * On lance une vraie recovery code-only : !OR si accepté, puis root-port OFF/ON.
+     */
+    gopro_schedule_code_only_recovery(reason);
 
-    ESP_LOGW(
-        TAG,
-        "[RECOVERY] %s -> nouvelle tentative live autorisée dans 60 s",
-        reason
-    );
+    /* Sécurité : aucune tentative START pendant la recovery. */
+    s_next_live_attempt_ms = now_ms + 120000;
 }
 
 // * Handler de la page racine
@@ -1174,268 +1210,6 @@ static void gopro_start_webcam_once(void)
     }
 }
 
-
-static esp_err_t gopro_http_get_usb(
-    const char *path,
-    const char *label,
-    char *response,
-    size_t response_size
-)
-{
-    if (response != NULL && response_size > 0) {
-        response[0] = '\0';
-    }
-
-    if (!s_usb_netif_ready || !s_cdc_network_connected || !s_gopro_open) {
-        ESP_LOGW(
-            TAG,
-            "[GOPRO-HTTP] %s impossible : USB/CDCNM non prêt",
-            label
-        );
-        return ESP_FAIL;
-    }
-
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-
-    if (sock < 0) {
-        ESP_LOGE(
-            TAG,
-            "[GOPRO-HTTP] %s : socket impossible, errno=%d",
-            label,
-            errno
-        );
-        return ESP_FAIL;
-    }
-
-    struct timeval timeout = {
-        .tv_sec = 5,
-        .tv_usec = 0
-    };
-
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-    /*
-     * Force la requête HTTP à sortir par l'interface USB GoPro.
-     */
-    struct sockaddr_in local_addr;
-    memset(&local_addr, 0, sizeof(local_addr));
-
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons(0);
-    local_addr.sin_addr.s_addr = inet_addr("172.20.140.50");
-
-    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        ESP_LOGE(
-            TAG,
-            "[GOPRO-HTTP] %s : bind USB 172.20.140.50 échoué, errno=%d",
-            label,
-            errno
-        );
-        close(sock);
-        return ESP_FAIL;
-    }
-
-    struct sockaddr_in gopro_addr;
-    memset(&gopro_addr, 0, sizeof(gopro_addr));
-
-    gopro_addr.sin_family = AF_INET;
-    gopro_addr.sin_port = htons(8080);
-    gopro_addr.sin_addr.s_addr = inet_addr("172.20.140.51");
-
-    if (connect(sock, (struct sockaddr *)&gopro_addr, sizeof(gopro_addr)) < 0) {
-        ESP_LOGE(
-            TAG,
-            "[GOPRO-HTTP] %s : connexion GoPro 172.20.140.51:8080 impossible, errno=%d",
-            label,
-            errno
-        );
-        close(sock);
-        return ESP_FAIL;
-    }
-
-    char request[384];
-
-    snprintf(
-        request,
-        sizeof(request),
-        "GET %s HTTP/1.1\r\n"
-        "Host: 172.20.140.51:8080\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        path
-    );
-
-    ESP_LOGW(
-        TAG,
-        "[GOPRO-HTTP] Envoi %s : %s",
-        label,
-        path
-    );
-
-    int request_len = strlen(request);
-    int sent_total = 0;
-
-    while (sent_total < request_len) {
-        int sent = send(
-            sock,
-            request + sent_total,
-            request_len - sent_total,
-            0
-        );
-
-        if (sent <= 0) {
-            ESP_LOGE(
-                TAG,
-                "[GOPRO-HTTP] %s : send impossible, errno=%d",
-                label,
-                errno
-            );
-            close(sock);
-            return ESP_FAIL;
-        }
-
-        sent_total += sent;
-    }
-
-    int response_len = 0;
-
-    if (response != NULL && response_size > 1) {
-        while (response_len < (int)response_size - 1) {
-            int received = recv(
-                sock,
-                response + response_len,
-                response_size - 1 - response_len,
-                0
-            );
-
-            if (received > 0) {
-                response_len += received;
-                continue;
-            }
-
-            break;
-        }
-
-        response[response_len] = '\0';
-
-        ESP_LOGI(
-            TAG,
-            "[GOPRO-HTTP] Réponse %s:\n%s",
-            label,
-            response
-        );
-    }
-
-    close(sock);
-
-    if (response != NULL) {
-        bool has_200 =
-            strstr(response, "HTTP/1.1 200 OK") != NULL;
-
-        bool has_error =
-            strstr(response, "HTTP/1.1 404") != NULL ||
-            strstr(response, "HTTP/1.1 400") != NULL ||
-            strstr(response, "HTTP/1.1 500") != NULL ||
-            strstr(response, "\"err_msg\"") != NULL ||
-            strstr(response, "Command is not recognized") != NULL;
-
-        if (has_200 && !has_error) {
-            return ESP_OK;
-        }
-    }
-
-    return ESP_FAIL;
-}
-
-static void gopro_recovery_after_reboot_before_start(void)
-{
-    char response[1024];
-
-    if (!s_after_usb_reconnect) {
-        return;
-    }
-
-    ESP_LOGW(TAG, "[GOPRO-RECOVERY] Reconnexion USB : recovery officielle sans !WRESET");
-
-    /*
-     * 1) Réactiver explicitement le contrôle USB filaire.
-     */
-    gopro_http_get_usb(
-        "/gopro/camera/control/wired_usb?p=1",
-        "wired_usb enable",
-        response,
-        sizeof(response)
-    );
-
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    /*
-     * 2) Diagnostic état webcam.
-     */
-    gopro_http_get_usb(
-        "/gopro/webcam/status",
-        "webcam status avant recovery",
-        response,
-        sizeof(response)
-    );
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    /*
-     * 3) Workaround officiel OpenGoPro :
-     * après une nouvelle connexion USB, faire start puis stop
-     * pour remettre la webcam dans un vrai état idle.
-     *
-     * Ici on utilise un start "prime", pas le vrai live.
-     * Même si aucun lecteur ne reçoit ce flux, ce n'est pas grave :
-     * le but est de débloquer l'état interne webcam.
-     */
-    gopro_http_get_usb(
-        "/gopro/webcam/start?port=8554&protocol=TS",
-        "webcam prime start",
-        response,
-        sizeof(response)
-    );
-
-    vTaskDelay(pdMS_TO_TICKS(2500));
-
-    gopro_http_get_usb(
-        "/gopro/webcam/stop",
-        "webcam prime stop",
-        response,
-        sizeof(response)
-    );
-
-    vTaskDelay(pdMS_TO_TICKS(2500));
-
-    /*
-     * 4) Sortie propre par sécurité.
-     */
-    gopro_http_get_usb(
-        "/gopro/webcam/exit",
-        "webcam exit",
-        response,
-        sizeof(response)
-    );
-
-    vTaskDelay(pdMS_TO_TICKS(2500));
-
-    /*
-     * 5) Vérifier l'état final.
-     */
-    gopro_http_get_usb(
-        "/gopro/webcam/status",
-        "webcam status après recovery",
-        response,
-        sizeof(response)
-    );
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    ESP_LOGW(TAG, "[GOPRO-RECOVERY] Fin recovery USB officielle, tentative START réel ensuite");
-}
-
 // Démarre le mode webcam par HTTP puis reçoit directement le flux UDP sur le port choisi.
 static void gopro_webcam_task(void *arg)
 {
@@ -1659,16 +1433,6 @@ ESP_LOGI(
         TAG,
         "[FORWARD] Chemin Ethernet préparé avant démarrage webcam"
     );
-
-    /*
-     * Après reboot/reconnexion GoPro :
-     * envoie automatique de la commande Labs !WRESET,
-     * puis nettoyage webcam avant START.
-     *
-     * Au premier boot, s_after_usb_reconnect=false :
-     * cette fonction ne fait rien.
-     */
-    gopro_recovery_after_reboot_before_start();
 
     // ******************** AJOUT : Arrêt propre de toute session webcam précédente ********************
     {
@@ -2094,6 +1858,7 @@ ESP_LOGI(
 
             if (packet_count == 1) {
                 s_live_running = true;
+                s_live_has_ever_run = true;
 
                 ESP_LOGI(
                     TAG,
@@ -2756,9 +2521,27 @@ static void decode_ethernet_frame(const uint8_t *eth, int len)
              */
             uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-            if (s_after_usb_reconnect) {
+            if (s_after_usb_reconnect && s_live_has_ever_run) {
+                /*
+                 * Cas observé dans tes logs : après redémarrage/reconnexion GoPro,
+                 * l'USB CDC-NCM et ARP reviennent, mais le premier START webcam donne error 4.
+                 * Donc on ne tente plus ce START inutile : on déclenche directement la
+                 * recovery forte qui a été validée expérimentalement.
+                 */
+                s_next_live_attempt_ms = now_ms + 120000;
+                ESP_LOGW(TAG, "[LIVE] ARP OK apres reconnexion USB post-live -> pas de START inutile, recovery forte directe");
+
+                if (!s_gopro_code_recovery_running) {
+                    gopro_schedule_code_only_recovery("reconnexion USB post-live : recovery préventive avant START");
+                }
+            } else if (s_after_usb_reconnect) {
+                /*
+                 * Reconnexion USB avant tout premier live : on reste prudent et on garde
+                 * l'ancien comportement, car il ne faut pas déclencher une recovery au boot
+                 * si aucun live n'a encore été prouvé.
+                 */
                 s_next_live_attempt_ms = now_ms + 30000;
-                ESP_LOGW(TAG, "[LIVE] ARP OK après reconnexion USB -> attente 30 s avant START webcam");
+                ESP_LOGW(TAG, "[LIVE] ARP OK après reconnexion USB avant premier live -> attente 30 s avant START webcam");
             } else {
                 s_next_live_attempt_ms = now_ms + 10000;
                 ESP_LOGW(TAG, "[LIVE] ARP OK premier boot -> attente 10 s avant START webcam");
@@ -3433,6 +3216,305 @@ static void gopro_usb_reset_session_after_disconnect(void)
      */
 }
 
+/*
+ * Requête HTTP simple vers la GoPro en forçant la sortie par l'interface USB.
+ * Utilisé pour tester !OR via l'endpoint Labs, puis pour stop/exit si possible.
+ */
+static bool gopro_http_usb_get_path(const char *path, char *response, size_t response_size)
+{
+    if (response != NULL && response_size > 0) {
+        response[0] = '\0';
+    }
+
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "[GOPRO-HTTP] socket impossible, errno=%d", errno);
+        return false;
+    }
+
+    struct timeval timeout = {
+        .tv_sec = 4,
+        .tv_usec = 0
+    };
+
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons(0);
+    local_addr.sin_addr.s_addr = inet_addr("172.20.140.50");
+
+    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        ESP_LOGE(TAG, "[GOPRO-HTTP] bind USB 172.20.140.50 échoué, errno=%d", errno);
+        close(sock);
+        return false;
+    }
+
+    struct sockaddr_in gopro_addr;
+    memset(&gopro_addr, 0, sizeof(gopro_addr));
+    gopro_addr.sin_family = AF_INET;
+    gopro_addr.sin_port = htons(8080);
+    gopro_addr.sin_addr.s_addr = inet_addr("172.20.140.51");
+
+    if (connect(sock, (struct sockaddr *)&gopro_addr, sizeof(gopro_addr)) < 0) {
+        ESP_LOGE(TAG, "[GOPRO-HTTP] connect GoPro échoué, errno=%d", errno);
+        close(sock);
+        return false;
+    }
+
+    char request[384];
+    snprintf(
+        request,
+        sizeof(request),
+        "GET %s HTTP/1.1\r\n"
+        "Host: 172.20.140.51:8080\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        path
+    );
+
+    int request_len = strlen(request);
+    int sent_total = 0;
+
+    while (sent_total < request_len) {
+        int sent = send(sock, request + sent_total, request_len - sent_total, 0);
+        if (sent <= 0) {
+            ESP_LOGE(TAG, "[GOPRO-HTTP] send échoué pour %s, errno=%d", path, errno);
+            close(sock);
+            return false;
+        }
+        sent_total += sent;
+    }
+
+    int total = 0;
+    if (response != NULL && response_size > 1) {
+        while (total < (int)response_size - 1) {
+            int r = recv(sock, response + total, (int)response_size - 1 - total, 0);
+            if (r > 0) {
+                total += r;
+                continue;
+            }
+            break;
+        }
+        response[total] = '\0';
+    } else {
+        char tmp[128];
+        while (recv(sock, tmp, sizeof(tmp), 0) > 0) {
+            ;
+        }
+    }
+
+    close(sock);
+
+    ESP_LOGI(
+        TAG,
+        "[GOPRO-HTTP] Réponse pour %s:\n%s",
+        path,
+        (response != NULL && response_size > 0) ? response : ""
+    );
+
+    return true;
+}
+
+static bool gopro_response_has_final_404_or_unrecognized(const char *response)
+{
+    if (response == NULL) {
+        return true;
+    }
+
+    if (strstr(response, "404 Not Found") != NULL ||
+        strstr(response, "Command is not recognized") != NULL ||
+        strstr(response, "err_msg") != NULL) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool gopro_try_labs_or_over_usb(void)
+{
+    char response[768];
+
+    ESP_LOGW(
+        TAG,
+        "[RECOVERY] Etape de stabilisation GoPro: appel Labs !OR via USB HTTP (peut etre refuse, on continue ensuite)"
+    );
+
+    bool sent = gopro_http_usb_get_path(
+        "/gopro/qrcode?labs=1&code=%21OR",
+        response,
+        sizeof(response)
+    );
+
+    if (!sent) {
+        ESP_LOGW(TAG, "[GOPRO-RECOVERY] !OR non envoyé : HTTP USB indisponible");
+        return false;
+    }
+
+    if (gopro_response_has_final_404_or_unrecognized(response)) {
+        ESP_LOGW(
+            TAG,
+            "[RECOVERY] Reponse Labs !OR refusee/ignoree -> suite normale: reset root-port USB"
+        );
+        return false;
+    }
+
+    ESP_LOGW(
+        TAG,
+        "[RECOVERY] !OR semble accepte -> attente reboot GoPro"
+    );
+
+    return true;
+}
+
+static void gopro_root_port_power(bool enabled)
+{
+    esp_err_t err = usb_host_lib_set_root_port_power(enabled);
+
+    if (err == ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "[USB-PORT] Root port USB %s demandé",
+            enabled ? "ON" : "OFF"
+        );
+    } else {
+        ESP_LOGE(
+            TAG,
+            "[USB-PORT] Root port USB %s erreur: %s",
+            enabled ? "ON" : "OFF",
+            esp_err_to_name(err)
+        );
+    }
+}
+
+static void gopro_code_only_recovery_task(void *arg)
+{
+    const char *reason = (const char *)arg;
+
+    s_gopro_code_recovery_running = true;
+
+    ESP_LOGW(
+        TAG,
+        "[RECOVERY] Début recovery STABLE : %s",
+        reason != NULL ? reason : "raison inconnue"
+    );
+
+    /*
+     * IMPORTANT :
+     * Cette recovery garde la séquence qui a marché dans tes logs.
+     *
+     * IMPORTANT POUR CETTE GOPRO :
+     * L'appel Labs !OR peut etre refuse par l'endpoint HTTP Labs.
+     * On le garde quand meme car les tests montrent que la version sans cette etape
+     * ne relance pas correctement le live, alors que la version avec cette etape fonctionne.
+     * Il faut donc considerer cette etape comme une phase de stabilisation/timing,
+     * pas comme la commande principale de reboot.
+     *
+     * La vraie partie utile est :
+     *   stop/exit -> reset session locale -> root-port OFF 5 s -> tentative root-port ON -> reboot volontaire.
+     *
+     * On ne laisse plus le heap crasher tout seul : on redémarre volontairement juste après.
+     */
+    char response[512];
+
+    gopro_http_usb_get_path("/gopro/webcam/stop", response, sizeof(response));
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    gopro_http_usb_get_path("/gopro/webcam/exit", response, sizeof(response));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    /*
+     * Cette commande est probablement refusée chez toi avec 404.
+     * Ce n'est PAS elle qui répare le live.
+     * On la garde seulement pour conserver le même comportement/timing que le code qui marchait.
+     */
+    bool or_ok = gopro_try_labs_or_over_usb();
+
+    if (or_ok) {
+        ESP_LOGW(TAG, "[RECOVERY] !OR accepté, attente reboot caméra avant reboot ESP32");
+        vTaskDelay(pdMS_TO_TICKS(8000));
+    } else {
+        ESP_LOGW(TAG, "[RECOVERY] Etape !OR terminee/refusee -> on garde la sequence root-port qui fonctionne");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /*
+     * Nettoyage local AVANT de couper le root port.
+     * Dans tes logs qui marchaient, cette étape avait lieu avant Root port OFF.
+     */
+    gopro_usb_reset_session_after_disconnect();
+
+    /*
+     * Coupe logique du root port.
+     * Le signe attendu dans les logs :
+     *   GoPro absente du bus USB
+     *   Périphérique USB débranché
+     */
+    ESP_LOGW(TAG, "[RECOVERY] Root port USB OFF pendant 5 s");
+    gopro_root_port_power(false);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    /*
+     * Dans le code qui marchait, il y avait aussi cette tentative ON.
+     * Même si elle renvoie ESP_ERR_INVALID_STATE, elle semble participer
+     * à remettre le contrôleur USB/PHY dans l'état qui permet le reboot propre.
+     *
+     * La différence avec l'ancien code : on ne reste pas vivant après.
+     * On redémarre volontairement tout de suite pour éviter le crash heap TLSF.
+     */
+    ESP_LOGW(TAG, "[RECOVERY] Root port USB ON demande puis reboot volontaire");
+    gopro_root_port_power(true);
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    ESP_LOGW(TAG, "[RECOVERY] esp_restart volontaire apres sequence OFF/ON");
+    esp_restart();
+
+    /*
+     * On ne doit jamais arriver ici.
+     */
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static void gopro_schedule_code_only_recovery(const char *reason)
+{
+    if (s_gopro_code_recovery_running) {
+        ESP_LOGW(TAG, "[RECOVERY] Recovery déjà planifiée");
+        return;
+    }
+
+    /*
+     * On met le flag avant xTaskCreate pour éviter qu'une deuxième notification
+     * USB/ARP planifie deux recoveries en parallèle.
+     */
+    s_gopro_code_recovery_running = true;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        gopro_code_only_recovery_task,
+        "gopro_recovery",
+        8192,
+        (void *)reason,
+        17,
+        NULL,
+        0
+    );
+
+    if (ok != pdPASS) {
+        s_gopro_code_recovery_running = false;
+        ESP_LOGE(TAG, "[RECOVERY] Création tâche recovery impossible");
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        s_next_live_attempt_ms = now_ms + 60000;
+    }
+}
+
 //* Callback princiaple appelé quand le client USB reçoit un événement (branché/débranché)
 static void usb_client_event_cb(const usb_host_client_event_msg_t *event_msg,
                                 void *arg)
@@ -3691,6 +3773,15 @@ static void usb_probe_init(void)
     // Active la bibliothèque USB Host de l'ESP32-S3.
 
     ESP_ERROR_CHECK(usb_host_install(&host_config));
+
+    /* S'assure que le root port USB Host est alimenté au démarrage. */
+    esp_err_t pwr_err = usb_host_lib_set_root_port_power(true);
+    if (pwr_err == ESP_OK) {
+        ESP_LOGI(TAG, "[USB-PORT] Root port USB ON au démarrage");
+    } else {
+        ESP_LOGW(TAG, "[USB-PORT] Root port ON non appliqué: %s", esp_err_to_name(pwr_err));
+    }
+
     // Lance la tâche interne USB Host.
     xTaskCreate(
         usb_host_daemon_task,
